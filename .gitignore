@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# 浏览器登录态与缓存（含账号信息，切勿提交）
+browser_profile/
+
+# 下载的图片
+pixiv_muxmus/
+
+# 临时 / 测试产物
+mux_test.txt
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 系统文件
+Thumbs.db
+.DS_Store
