@@ -199,37 +199,71 @@ def search_total(page, name, s_mode="s_tag"):
     }""", {"name": name, "s_mode": s_mode})
 
 
-def fetch_pids(page, tag, count, s_mode="s_tag"):
-    """在已登录的页面上调用 pixiv 搜索接口，按时间倒序获取 count 个 PID。
-    每页 fetch 带 20 秒超时，超时自动重试该页（最多 3 次）。"""
-    return page.evaluate("""async ({tag, count, s_mode}) => {
+def search_page(page, name, s_mode, pn):
+    """请求 pixiv 搜索的第 pn 页，返回 {'ok':bool, 'ids':[...], 'total':int}。
+    total=-1 表示该页未带总数；ok=False 表示请求失败/超时。"""
+    return page.evaluate("""async ({name, s_mode, pn}) => {
         const withTimeout = (p, ms) => Promise.race([
             p, new Promise(res => setTimeout(() => res(null), ms))
         ]);
-        const ids = [];
-        let pn = 1;
-        while (ids.length < count && pn <= 50) {
-            const url = `https://www.pixiv.net/ajax/search/artworks/${encodeURIComponent(tag)}`
-                + `?word=${encodeURIComponent(tag)}&order=date_d&mode=all&s_mode=${s_mode}&type=all&p=${pn}`;
-            let data = null;
-            for (let attempt = 0; attempt < 3 && data === null; attempt++) {
-                try {
-                    const r = await withTimeout(fetch(url, {credentials:'include'}), 20000);
-                    if (!r) continue;                     // 超时，重试该页
-                    const j = await r.json();
-                    data = (j && j.body && j.body.illustManga && j.body.illustManga.data) || [];
-                } catch (e) { data = []; break; }         // 网络异常，停止
-            }
-            if (!data || !data.length) break;             // 3次超时或无结果
-            for (const item of data) {
-                if (ids.length >= count) break;
-                ids.push(String(item.id));
-            }
-            pn++;
-            await new Promise(res => setTimeout(res, 250));
-        }
-        return ids;
-    }""", {"tag": tag, "count": count, "s_mode": s_mode})
+        try {
+            const r = await withTimeout(fetch(
+                `https://www.pixiv.net/ajax/search/artworks/${encodeURIComponent(name)}`
+                + `?word=${encodeURIComponent(name)}&order=date_d&mode=all&s_mode=${s_mode}&type=all&p=${pn}`,
+                {credentials:'include'}), 20000);
+            if (!r) return {ok: false, ids: [], total: -1};
+            const j = await r.json();
+            const im = j && j.body && j.body.illustManga;
+            return {
+                ok: true,
+                ids: (im && Array.isArray(im.data) ? im.data : []).map(it => String(it.id)),
+                total: (im && typeof im.total === 'number') ? im.total : -1,
+            };
+        } catch (e) { return {ok: false, ids: [], total: -1}; }
+    }""", {"name": name, "s_mode": s_mode, "pn": pn})
+
+
+def fetch_pids(page, name, count, s_mode="s_tag", max_pages=100):
+    """在已登录页面逐页调用 pixiv 搜索接口，按时间倒序获取 count 个 PID。
+    每页请求失败或返回空时退避重试（最多 6 次），用 total 判断是否真取完，
+    避免 pixiv 限流导致提前停止。返回 (ids, total)。"""
+    ids = []
+    total = -1
+    pn = 1
+    bad_streak = 0
+    while len(ids) < count and pn <= max_pages:
+        res = search_page(page, name, s_mode, pn)
+        if not res.get("ok"):
+            bad_streak += 1
+            if bad_streak >= 6:
+                print(f"      [提示] 第{pn}页请求连续失败，停止获取")
+                break
+            time.sleep(2 * bad_streak)
+            continue
+        bad_streak = 0
+        if total < 0 and res.get("total", -1) >= 0:
+            total = res["total"]
+        page_ids = res.get("ids") or []
+        if not page_ids:
+            if total >= 0 and len(ids) >= total:
+                break  # 已取完
+            # 空页但总数未取完 -> 疑似限流/软上限，退避重试该页
+            bad_streak += 1
+            if bad_streak >= 6:
+                print(f"      [提示] 第{pn}页为空（可能被限流或已达可获取上限），停止")
+                break
+            time.sleep(2 * bad_streak)
+            continue
+        ids.extend(page_ids)
+        ids = list(dict.fromkeys(ids))  # 按序去重
+        if len(ids) > count:
+            ids = ids[:count]           # 恰好取 count 个，不多取
+        if pn % 3 == 0 or len(ids) >= count:
+            extra = f"（共{total}件）" if total >= 0 else ""
+            print(f"      [进度] 第{pn}页，已获取 {len(ids)}/{count} {extra}")
+        pn += 1
+        time.sleep(0.5)
+    return ids, total
 
 
 def download_images(txt_path, cn):
@@ -374,12 +408,18 @@ def main():
 
         # ---------- 4. 搜索获取 PID ----------
         print(f"[3/4] 搜索「{search_name}」，目标 {count} 个 PID ...")
-        pids = fetch_pids(page, search_name, count, search_mode)
+        pids, total = fetch_pids(page, search_name, count, search_mode)
         ctx.close()
 
     if not pids:
         print("[X] 未获取到任何 PID（可能标签无结果，或需要更换搜索词）")
         return
+    if total >= 0:
+        print(f"[OK] 已获取 {len(pids)} 个 PID（pixiv 共 {total} 件）")
+        if len(pids) < count and len(pids) < total:
+            print(f"[提示] 只取到 {len(pids)} 个（未达 {count}），可能被限流，可稍后运行续传补下")
+    else:
+        print(f"[OK] 已获取 {len(pids)} 个 PID")
 
     # ---------- 5. 合并写入 names/<中文名>.txt ----------
     print("[4/4] 写入 PID 列表并下载 ...")
