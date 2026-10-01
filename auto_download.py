@@ -12,8 +12,10 @@
   6. 调用 muxmus_download.py 经 i.muxmus.com 下载图片到 W:\\临时文件夹\\<中文名>
 
 用法:
-    python auto_download.py                # 完整流程：自动取名 + 搜索 + 下载
-    python auto_download.py <中文名>       # 断点续传：只补下载缺失图片（跳过浏览器）
+    python auto_download.py                # 交互式：下载单个角色
+    python auto_download.py -f <名单文件>   # 批量：每行「中文名 数量」，一次跑完整个名单
+    python auto_download.py <中文名>        # 断点续传：只补下载缺失图片（跳过浏览器）
+    python auto_download.py <名单文件>      # 位置参数是已存在文件时自动按批量处理
 """
 import os
 import re
@@ -290,13 +292,241 @@ def download_images(txt_path, cn):
     return True
 
 
+def parse_batch_file(path):
+    """读取批量名单文件。每行格式:「中文名 数量」（空格/制表符/全角空格分隔），
+    数量可省略（用默认值）；支持空行与 # 开头注释。返回 [(中文名, 数量), ...]"""
+    items = []
+    with open(path, "r", encoding="utf-8-sig") as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith("//"):
+                continue
+            parts = [p for p in re.split(r"[\s\u3000]+", line) if p]
+            cn = parts[0]
+            cnt = DEFAULT_COUNT
+            if len(parts) >= 2:
+                try:
+                    cnt = max(1, int(parts[1]))
+                except ValueError:
+                    print(f"  [警告] 第{lineno}行数量「{parts[1]}」无效，改用默认 {DEFAULT_COUNT}")
+            items.append((cn, cnt))
+    return items
+
+
+def launch_browser(pw):
+    """启动 Edge（失败则回退 Playwright Chromium），返回持久化上下文"""
+    try:
+        return pw.chromium.launch_persistent_context(
+            user_data_dir=PROFILE_DIR,
+            channel="msedge",          # 优先用系统已装的 Edge
+            headless=False,
+            viewport={"width": 1280, "height": 900},
+        )
+    except Exception as e:
+        print(f"[提示] Edge 启动失败（{e}），回退到 Playwright Chromium ...")
+        return pw.chromium.launch_persistent_context(
+            user_data_dir=PROFILE_DIR,
+            headless=False,
+        )
+
+
+def open_and_login(page):
+    """打开 pixiv 并确保已登录（等待页面稳定 + 自动重试）。返回 True/False"""
+    try:
+        open_pixiv(page)
+    except Exception as e:
+        print(f"[X] 无法打开 pixiv.net（{e}）")
+        print("    请确认系统代理已开启（访问 pixiv 需要代理/VPN），然后重试")
+        return False
+
+    logged = detect_login(page)
+    if logged is None:
+        logged = False
+
+    if not logged:
+        print("\n[!] 未检测到 pixiv 登录态。请在打开的浏览器窗口中登录 pixiv，")
+        input("    登录完成后回到本程序按回车继续...")
+        logged = detect_login(page)
+        if not logged:
+            try:
+                open_pixiv(page)   # 回到首页再确认一次登录态
+            except Exception:
+                pass
+            logged = detect_login(page)
+
+    if not logged:
+        print("[X] 仍未检测到登录态，请确认已登录 pixiv 后再试")
+        return False
+    return True
+
+
+def process_character(page, cn, count, batch=False, jp_name=None, en_name=None):
+    """处理单个角色: 取名 -> 作品数校验 -> 搜索 PID -> 写 names/<中文名>.txt -> 下载图片。
+    jp_name 已给出时跳过萌娘百科查询；batch=True 时不弹交互确认（自动采用提取的名字、
+    作品数过少也继续下载），适合名单批量跑。返回结果字典。"""
+    print(f"\n{'-' * 56}")
+    print(f"  【{cn}】目标 {count} 张")
+    print(f"{'-' * 56}")
+
+    # ---- 1. 萌娘百科取 日文名/英文名 ----
+    if jp_name is None:
+        jp_name, en_name = fetch_moegirl(cn)
+        if jp_name:
+            en_txt = f"，英文名「{en_name}」" if en_name else "（页面无英文名）"
+            print(f"[OK] 萌娘百科: 日文名「{jp_name}」{en_txt}")
+            if not batch:
+                fix = input(f"     确认日文名（回车用「{jp_name}」，或输入修正值）: ").strip()
+                if fix:
+                    jp_name = fix
+        else:
+            print("[提示] 萌娘百科未获取到日文名（页面不存在或格式特殊）")
+            if batch:
+                print(f"[跳过] 「{cn}」无法确定日文名，跳过该角色")
+                return {"cn": cn, "error": "取名失败"}
+            jp_name = input("     请手动输入日文名（直接回车取消）: ").strip()
+            if not jp_name:
+                return {"cn": cn, "error": "未提供日文名"}
+            en_name = ""
+    en_name = en_name or ""
+
+    # ---- 2. 作品数校验 + 选择搜索词 ----
+    total_jp = search_total(page, jp_name, "s_tag")
+    total_en = 0
+    if total_jp >= 0:
+        if total_jp < TOO_FEW and en_name:
+            total_en = search_total(page, en_name, "s_tc")
+        line = f"[信息] pixiv 作品数: 「{jp_name}」= {total_jp}"
+        if en_name:
+            line += f"，「{en_name}」= {total_en}"
+        print(line)
+        if total_jp >= TOO_FEW or total_jp >= total_en:
+            search_name, search_mode = jp_name, "s_tag"
+        else:
+            search_name, search_mode = en_name, "s_tc"
+            print(f"[提示] 日文名作品数({total_jp})不足 {TOO_FEW}，改用英文名「{en_name}」({total_en})")
+        if max(total_jp, total_en) < TOO_FEW:
+            print("[警告] 作品数过少，日文名可能不正确，或该角色在 pixiv 作品很少")
+            if not batch and input("       仍然继续？(y/N): ").strip().lower() != "y":
+                return {"cn": cn, "jp": jp_name, "total": total_jp, "error": "用户取消"}
+    else:
+        print("[提示] 作品数查询失败，跳过校验，直接使用日文名")
+        search_name, search_mode = jp_name, "s_tag"
+
+    # ---- 3. 搜索 PID ----
+    print(f"[搜索] 「{search_name}」，目标 {count} 个 PID ...")
+    pids, total = fetch_pids(page, search_name, count, search_mode)
+    if not pids:
+        print("[X] 未获取到任何 PID（可能标签无结果）")
+        return {"cn": cn, "jp": jp_name, "total": total_jp, "error": "无搜索结果"}
+    if total >= 0:
+        print(f"[OK] 已获取 {len(pids)} 个 PID（pixiv 共 {total} 件）")
+        if len(pids) < count and len(pids) < total:
+            print(f"[提示] 只取到 {len(pids)} 个（未达 {count}），可能被限流，可稍后重跑补下")
+    else:
+        print(f"[OK] 已获取 {len(pids)} 个 PID")
+
+    # ---- 4. 合并写入 names/<中文名>.txt ----
+    txt_path = os.path.join(NAMES_DIR, cn + ".txt")
+    old = load_pid_file(txt_path)
+    old_set = set(old)
+    merged = old + [x for x in pids if x not in old_set]
+    save_pid_file(txt_path, merged)
+    print(f"[OK] PID 已写入 {txt_path}（新 {len(pids)} 个，累计 {len(merged)} 个）")
+
+    # ---- 5. 下载图片 ----
+    ok = download_images(txt_path, cn)
+    return {"cn": cn, "jp": jp_name, "en": en_name, "total": total_jp,
+            "pids": len(pids), "downloaded": ok}
+
+
+USAGE = """用法:
+  python auto_download.py                 交互式下载单个角色（输入中文名 + 数量）
+  python auto_download.py <中文名>         断点续传：补下载缺失图片（跳过浏览器）
+  python auto_download.py -f <名单文件>     批量下载名单里的所有角色
+  python auto_download.py <名单文件>        同上（位置参数是已存在的文件时自动识别）
+
+名单文件格式（每行一个角色，空格分隔，数量可省略，# 开头为注释）:
+  桐藤渚 500
+  白尾绘里 300
+  天见和香
+"""
+
+
 def main():
     argv = sys.argv[1:]
+    os.makedirs(NAMES_DIR, exist_ok=True)
 
-    # ========== 断点续传模式: python auto_download.py <中文名> ==========
-    # 跳过浏览器/搜索，直接用 names/<中文名>.txt 补下载缺失图片
-    if argv:
-        resume_cn = argv[0].strip()
+    batch_file = None
+    resume_cn = None
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-f", "--file"):
+            if i + 1 >= len(argv):
+                print("[X] -f 后面需要跟名单文件路径")
+                return
+            batch_file = argv[i + 1]
+            i += 2
+            continue
+        if a in ("-h", "--help"):
+            print(USAGE)
+            return
+        if os.path.isfile(a):       # 位置参数是已存在的文件 -> 批量名单
+            batch_file = a
+        else:                       # 否则当作角色中文名 -> 断点续传
+            resume_cn = a
+        i += 1
+
+    # ==================== 批量下载模式 ====================
+    if batch_file:
+        if not os.path.exists(batch_file):
+            print(f"[X] 找不到名单文件: {batch_file}")
+            return
+        items = parse_batch_file(batch_file)
+        if not items:
+            print(f"[X] 名单为空: {batch_file}")
+            return
+        print("=" * 56)
+        print(f"  批量下载模式：{len(items)} 个角色（名单: {os.path.basename(batch_file)}）")
+        print("=" * 56)
+        for n, (cn, cnt) in enumerate(items, 1):
+            print(f"  {n:>3}. {cn}  {cnt} 张")
+
+        results = []
+        with sync_playwright() as p:
+            ctx = launch_browser(p)
+            page = ctx.new_page()
+            if not open_and_login(page):
+                ctx.close()
+                return
+            for n, (cn, cnt) in enumerate(items, 1):
+                print(f"\n[{n}/{len(items)}] {cn}")
+                try:
+                    results.append(process_character(page, cn, cnt, batch=True))
+                except Exception as e:
+                    print(f"[X] 「{cn}」处理失败: {e}")
+                    results.append({"cn": cn, "error": str(e)})
+            ctx.close()
+
+        # ---- 批量结果汇总 ----
+        print("\n" + "=" * 56)
+        print("  批量下载完成，汇总")
+        print("=" * 56)
+        ok_n = 0
+        for i, r in enumerate(results, 1):
+            if r.get("error"):
+                print(f"  {i:>3}. {r['cn']}  [失败] {r['error']}")
+            else:
+                ok_n += 1
+                print(f"  {i:>3}. {r['cn']}  日文名「{r.get('jp', '')}」  "
+                      f"作品数 {r.get('total', -1)}  获取 {r.get('pids', 0)} 个 PID  "
+                      f"{'下载完成' if r.get('downloaded') else '下载未完成'}")
+        print(f"\n成功 {ok_n}/{len(results)} 个角色")
+        return
+
+    # ==================== 断点续传模式 ====================
+    if resume_cn:
         txt_path = os.path.join(NAMES_DIR, resume_cn + ".txt")
         if not os.path.exists(txt_path):
             print(f"[X] 找不到 {txt_path}，无法续传（请先正常跑一次完整流程生成该文件）")
@@ -308,19 +538,19 @@ def main():
         download_images(txt_path, resume_cn)
         return
 
+    # ==================== 交互式单角色模式 ====================
     print("=" * 56)
     print("  一键角色图片自动下载（模拟浏览器）")
     print("=" * 56)
+    print("提示: 批量下载请用  python auto_download.py -f 名单.txt")
     cn = input("角色中文名（如 桐藤渚）: ").strip()
     if not cn:
         print("[X] 中文名不能为空")
         return
     count = ask_int(f"下载图片数量（默认 {DEFAULT_COUNT}）: ", DEFAULT_COUNT)
 
-    os.makedirs(NAMES_DIR, exist_ok=True)
-
-    # ---------- 1. 萌娘百科自动获取 日文名/英文名 ----------
-    print(f"\n[1/4] 正在查询萌娘百科「{cn}」...")
+    # 先取名字并确认（此时还没开浏览器）
+    print(f"\n[1/2] 正在查询萌娘百科「{cn}」...")
     jp_name, en_name = fetch_moegirl(cn)
     if jp_name:
         en_txt = f"，英文名「{en_name}」" if en_name else "（页面无英文名）"
@@ -336,103 +566,15 @@ def main():
             return
         en_name = ""
 
-    # ---------- 2. 启动浏览器（持久化登录态） ----------
+    print("[2/2] 启动浏览器 ...")
     with sync_playwright() as p:
-        try:
-            ctx = p.chromium.launch_persistent_context(
-                user_data_dir=PROFILE_DIR,
-                channel="msedge",          # 优先用系统已装的 Edge
-                headless=False,
-                viewport={"width": 1280, "height": 900},
-            )
-        except Exception as e:
-            print(f"[提示] Edge 启动失败（{e}），回退到 Playwright Chromium ...")
-            ctx = p.chromium.launch_persistent_context(
-                user_data_dir=PROFILE_DIR,
-                headless=False,
-            )
+        ctx = launch_browser(p)
         page = ctx.new_page()
-        try:
-            open_pixiv(page)
-        except Exception as e:
-            print(f"[X] 无法打开 pixiv.net（{e}）")
-            print("    请确认系统代理已开启（访问 pixiv 需要代理/VPN），然后重试")
+        if not open_and_login(page):
             ctx.close()
             return
-
-        # ---------- 2. 登录态检测（等待页面稳定 + 自动重试） ----------
-        logged = detect_login(page)
-        if logged is None:
-            logged = False
-
-        if not logged:
-            print("\n[!] 未检测到 pixiv 登录态。请在打开的浏览器窗口中登录 pixiv，")
-            input("    登录完成后回到本程序按回车继续...")
-            logged = detect_login(page)
-            if not logged:
-                try:
-                    open_pixiv(page)   # 回到首页再确认一次登录态
-                except Exception:
-                    pass
-                logged = detect_login(page)
-
-        if not logged:
-            print("[X] 仍未检测到登录态，请确认已登录 pixiv 后再试")
-            ctx.close()
-            return
-
-        # ---------- 3. 作品数校验 + 选择搜索词 ----------
-        print("[2/4] 校验 pixiv 作品数...")
-        total_jp = search_total(page, jp_name, "s_tag")
-        total_en = 0
-        if total_jp >= 0:
-            if total_jp < TOO_FEW and en_name:
-                total_en = search_total(page, en_name, "s_tc")
-            line = f"[信息] pixiv 作品数: 「{jp_name}」= {total_jp}"
-            if en_name:
-                line += f"，「{en_name}」= {total_en}"
-            print(line)
-            if total_jp >= TOO_FEW or total_jp >= total_en:
-                search_name, search_mode = jp_name, "s_tag"
-            else:
-                search_name, search_mode = en_name, "s_tc"
-                print(f"[提示] 日文名作品数({total_jp})不足 {TOO_FEW}，改用英文名「{en_name}」({total_en})")
-            if max(total_jp, total_en) < TOO_FEW:
-                print(f"[警告] 作品数过少，日文名可能不正确，或该角色在 pixiv 作品很少")
-                if input("       仍然继续？(y/N): ").strip().lower() != "y":
-                    ctx.close()
-                    return
-        else:
-            print("[提示] 作品数查询失败，跳过校验，直接使用日文名")
-            search_name, search_mode = jp_name, "s_tag"
-
-        # ---------- 4. 搜索获取 PID ----------
-        print(f"[3/4] 搜索「{search_name}」，目标 {count} 个 PID ...")
-        pids, total = fetch_pids(page, search_name, count, search_mode)
+        process_character(page, cn, count, batch=False, jp_name=jp_name, en_name=en_name)
         ctx.close()
-
-    if not pids:
-        print("[X] 未获取到任何 PID（可能标签无结果，或需要更换搜索词）")
-        return
-    if total >= 0:
-        print(f"[OK] 已获取 {len(pids)} 个 PID（pixiv 共 {total} 件）")
-        if len(pids) < count and len(pids) < total:
-            print(f"[提示] 只取到 {len(pids)} 个（未达 {count}），可能被限流，可稍后运行续传补下")
-    else:
-        print(f"[OK] 已获取 {len(pids)} 个 PID")
-
-    # ---------- 5. 合并写入 names/<中文名>.txt ----------
-    print("[4/4] 写入 PID 列表并下载 ...")
-    txt_path = os.path.join(NAMES_DIR, cn + ".txt")
-    old = load_pid_file(txt_path)
-    old_set = set(old)
-    merged = old + [x for x in pids if x not in old_set]
-    save_pid_file(txt_path, merged)
-    print(f"[OK] PID 已写入 {txt_path}（新 {len(pids)} 个，累计 {len(merged)} 个）")
-
-    # ---------- 6. 下载图片（已存在跳过/损坏修复/断网重试5次） ----------
-    if not download_images(txt_path, cn):
-        return
 
 
 if __name__ == "__main__":
